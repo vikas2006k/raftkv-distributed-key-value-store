@@ -86,3 +86,22 @@ func TestElectionFailsWithoutMajority(t *testing.T) {
 		t.Fatal("candidate must not become leader without a majority")
 	}
 }
+
+func TestElectionRecordsLeaderID(t *testing.T) {
+	nodes := makeTestCluster(5)
+	candidate := nodes[0]
+
+	RunElection(nodes, candidate)
+
+	if candidate.State != Leader {
+		t.Fatal("expected candidate to become leader")
+	}
+
+	if candidate.LeaderID != candidate.ID {
+		t.Fatalf(
+			"expected LeaderID %d, got %d",
+			candidate.ID,
+			candidate.LeaderID,
+		)
+	}
+}

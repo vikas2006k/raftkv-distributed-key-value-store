@@ -22,6 +22,7 @@ type Raft struct {
 	log         []LogEntry
 	CommitIndex int
 	LastApplied int
+	LeaderID    int
 }
 
 func newRaft(id int) *Raft {
@@ -33,19 +34,8 @@ func newRaft(id int) *Raft {
 		log:         make([]LogEntry, 0),
 		CommitIndex: 0,
 		LastApplied: 0,
+		LeaderID:    -1,
 	}
-}
-
-type VoteRequest struct {
-	Term         int
-	CandidateID  int
-	LastLogIndex int
-	LastLogTerm  int
-}
-
-type VoteResponse struct {
-	Term        int
-	VoteGranted bool
 }
 
 func (s State) String() string {
@@ -147,6 +137,7 @@ func RunElection(nodes []*Raft, candidate *Raft) int {
 	// Check the result only after collecting the votes.
 	if candidate.State == Candidate && votes >= majority {
 		candidate.State = Leader
+		candidate.LeaderID = candidate.ID
 	}
 
 	return votes
