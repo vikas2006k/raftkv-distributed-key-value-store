@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net/rpc"
 )
 
@@ -50,3 +51,67 @@ func RequestVoteOverRPC(
 
 	return response, nil
 }
+
+
+func RunElectionOverRPC(candidate *Raft, peerAddresses []string) int {
+    candidate.StartElection()
+
+    votes := 1 // The candidate votes for itself.
+    clusterSize := len(peerAddresses) + 1
+    majority := clusterSize/2 + 1
+
+    fmt.Printf(
+        "Node %d starts election for term %d\n",
+        candidate.ID,
+        candidate.CurrentTerm,
+    )
+
+    for _, address := range peerAddresses {
+        request := VoteRequest{
+            Term:         candidate.CurrentTerm,
+            CandidateID:  candidate.ID,
+            LastLogIndex: candidate.LastLogIndex(),
+            LastLogTerm:  candidate.LastLogTerm(),
+        }
+
+        response, err := RequestVoteOverRPC(address, request)
+        if err != nil {
+            fmt.Printf("Could not get vote from %s: %v\n", address, err)
+            continue
+        }
+
+        if response.Term > candidate.CurrentTerm {
+            candidate.CurrentTerm = response.Term
+            candidate.State = Follower
+            candidate.VotedFor = -1
+            candidate.LeaderID = -1
+
+            fmt.Println("Discovered a higher term; stepping down.")
+            return votes
+        }
+
+        if response.VoteGranted {
+            votes++
+            fmt.Printf("Received vote from %s\n", address)
+        }
+
+        if votes >= majority {
+            candidate.State = Leader
+            candidate.LeaderID = candidate.ID
+            fmt.Printf(
+                "Node %d becomes leader with %d votes\n",
+                candidate.ID,
+                votes,
+            )
+            return votes
+        }
+    }
+
+    fmt.Printf(
+        "Election not won: %d votes; %d required\n",
+        votes,
+        majority,
+    )
+    return votes
+}
+
