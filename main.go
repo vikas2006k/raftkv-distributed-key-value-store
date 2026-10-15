@@ -1,8 +1,48 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+)
 
 func main() {
+
+
+	
+if len(os.Args) > 1 && os.Args[1] == "rpc-client" {
+    request := VoteRequest{
+        Term:         1,
+        CandidateID:  1,
+        LastLogIndex: 0,
+        LastLogTerm:  0,
+    }
+
+    response, err := RequestVoteOverRPC(
+        "localhost:9001",
+        request,
+    )
+    if err != nil {
+        fmt.Println("RPC client error:", err)
+        os.Exit(1)
+    }
+
+    fmt.Println("RPC request sent successfully!")
+    fmt.Printf("Response term: %d\n", response.Term)
+    fmt.Printf("Vote granted: %t\n", response.VoteGranted)
+    return
+}
+
+
+	if len(os.Args) > 1 && os.Args[1] == "rpc-server" {
+		node := newRaft(2)
+
+		if err := StartRPCServer(node, ":9001"); err != nil {
+			fmt.Println("RPC server error:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	const clusterSize = 5
 
 	nodes := NewCluster(clusterSize)
