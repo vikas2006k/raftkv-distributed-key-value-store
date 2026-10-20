@@ -1,5 +1,7 @@
 package main
 
+import "sync"
+
 type State int
 
 const (
@@ -14,6 +16,8 @@ type LogEntry struct {
 }
 
 type Raft struct {
+	mu sync.Mutex
+
 	ID          int
 	CurrentTerm int
 	State       State
@@ -54,16 +58,31 @@ func (s State) String() string {
 }
 
 func (r *Raft) StartElection() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	r.CurrentTerm++
 	r.State = Candidate
 	r.VotedFor = r.ID
+	r.LeaderID = -1
 }
 
 func (r *Raft) LastLogIndex() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	return len(r.log)
 }
 
 func (r *Raft) LastLogTerm() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.lastLogTermLocked()
+}
+
+// Caller must already hold r.mu.
+func (r *Raft) lastLogTermLocked() int {
 	if len(r.log) == 0 {
 		return 0
 	}
@@ -71,6 +90,9 @@ func (r *Raft) LastLogTerm() int {
 }
 
 func (r *Raft) RequestVote(args VoteRequest) VoteResponse {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	response := VoteResponse{
 		Term:        r.CurrentTerm,
 		VoteGranted: false,
@@ -84,20 +106,26 @@ func (r *Raft) RequestVote(args VoteRequest) VoteResponse {
 		r.CurrentTerm = args.Term
 		r.State = Follower
 		r.VotedFor = -1
+		r.LeaderID = -1
 	}
 
 	response.Term = r.CurrentTerm
 
-	candidateLogIsUpToDate := (args.LastLogTerm > r.LastLogTerm()) ||
-		(args.LastLogTerm == r.LastLogTerm() && args.LastLogIndex >= r.LastLogIndex())
+	lastLogIndex := len(r.log)
+	lastLogTerm := r.lastLogTermLocked()
 
-	if candidateLogIsUpToDate && (r.VotedFor == -1 || r.VotedFor == args.CandidateID) {
+	candidateLogIsUpToDate :=
+		args.LastLogTerm > lastLogTerm ||
+			(args.LastLogTerm == lastLogTerm &&
+				args.LastLogIndex >= lastLogIndex)
+
+	if candidateLogIsUpToDate &&
+		(r.VotedFor == -1 || r.VotedFor == args.CandidateID) {
 		r.VotedFor = args.CandidateID
 		response.VoteGranted = true
 	}
 
 	return response
-
 }
 
 func RunElection(nodes []*Raft, candidate *Raft) int {
