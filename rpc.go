@@ -52,66 +52,74 @@ func RequestVoteOverRPC(
 	return response, nil
 }
 
+func RunElectionOverRPC(
+	candidate *Raft,
+	peerAddresses []string,
+) int {
+	candidate.StartElection()
 
-func RunElectionOverRPC(candidate *Raft, peerAddresses []string) int {
-    candidate.StartElection()
+	votes := 1 // The candidate votes for itself.
+	clusterSize := len(peerAddresses) + 1
+	majority := clusterSize/2 + 1
 
-    votes := 1 // The candidate votes for itself.
-    clusterSize := len(peerAddresses) + 1
-    majority := clusterSize/2 + 1
+	fmt.Printf(
+		"Node %d starts election for term %d\n",
+		candidate.ID,
+		candidate.CurrentTerm,
+	)
 
-    fmt.Printf(
-        "Node %d starts election for term %d\n",
-        candidate.ID,
-        candidate.CurrentTerm,
-    )
+	for _, address := range peerAddresses {
+		request := VoteRequest{
+			Term:         candidate.CurrentTerm,
+			CandidateID:  candidate.ID,
+			LastLogIndex: candidate.LastLogIndex(),
+			LastLogTerm:  candidate.LastLogTerm(),
+		}
 
-    for _, address := range peerAddresses {
-        request := VoteRequest{
-            Term:         candidate.CurrentTerm,
-            CandidateID:  candidate.ID,
-            LastLogIndex: candidate.LastLogIndex(),
-            LastLogTerm:  candidate.LastLogTerm(),
-        }
+		response, err := RequestVoteOverRPC(address, request)
+		if err != nil {
+			fmt.Printf(
+				"Could not get vote from %s: %v\n",
+				address,
+				err,
+			)
+			continue
+		}
 
-        response, err := RequestVoteOverRPC(address, request)
-        if err != nil {
-            fmt.Printf("Could not get vote from %s: %v\n", address, err)
-            continue
-        }
+		// Step down if the remote node reports a higher term.
+		if candidate.stepDownIfHigherTerm(response.Term) {
+			fmt.Printf(
+				"Node %d discovered higher term %d and stepped down\n",
+				candidate.ID,
+				response.Term,
+			)
+			return votes
+		}
 
-        if response.Term > candidate.CurrentTerm {
-            candidate.CurrentTerm = response.Term
-            candidate.State = Follower
-            candidate.VotedFor = -1
-            candidate.LeaderID = -1
+		if response.VoteGranted {
+			votes++
+			fmt.Printf("Received vote from %s\n", address)
+		}
 
-            fmt.Println("Discovered a higher term; stepping down.")
-            return votes
-        }
+		if votes >= majority {
+			// State synchronization will be improved in our next step.
+			candidate.State = Leader
+			candidate.LeaderID = candidate.ID
 
-        if response.VoteGranted {
-            votes++
-            fmt.Printf("Received vote from %s\n", address)
-        }
+			fmt.Printf(
+				"Node %d becomes leader with %d votes\n",
+				candidate.ID,
+				votes,
+			)
+			return votes
+		}
+	}
 
-        if votes >= majority {
-            candidate.State = Leader
-            candidate.LeaderID = candidate.ID
-            fmt.Printf(
-                "Node %d becomes leader with %d votes\n",
-                candidate.ID,
-                votes,
-            )
-            return votes
-        }
-    }
+	fmt.Printf(
+		"Election not won: %d votes; %d required\n",
+		votes,
+		majority,
+	)
 
-    fmt.Printf(
-        "Election not won: %d votes; %d required\n",
-        votes,
-        majority,
-    )
-    return votes
+	return votes
 }
-

@@ -67,6 +67,22 @@ func (r *Raft) StartElection() {
 	r.LeaderID = -1
 }
 
+func (r *Raft) stepDownIfHigherTerm(term int) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if term <= r.CurrentTerm {
+		return false
+	}
+
+	r.CurrentTerm = term
+	r.State = Follower
+	r.VotedFor = -1
+	r.LeaderID = -1
+
+	return true
+}
+
 func (r *Raft) LastLogIndex() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
