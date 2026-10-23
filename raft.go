@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"math/rand"
+	"strings"
 	"sync"
 	"time"
 )
@@ -37,35 +38,35 @@ type Raft struct {
 
 	nextIndex  map[int]int
 	matchIndex map[int]int
+
+	kvStore  map[string]string
+	stateDir string
 }
 
 func newRaft(id int) *Raft {
 	return &Raft{
-		ID:          id,
-		CurrentTerm: 0,
-		State:       Follower,
-		VotedFor:    -1,
-		log:         make([]LogEntry, 0),
-		CommitIndex: 0,
-		LastApplied: 0,
-		LeaderID:    -1,
-
+		ID:              id,
+		CurrentTerm:     0,
+		State:           Follower,
+		VotedFor:        -1,
+		log:             make([]LogEntry, 0),
+		CommitIndex:     0,
+		LastApplied:     0,
+		LeaderID:        -1,
 		electionResetCh: make(chan struct{}, 1),
+		kvStore:         make(map[string]string),
+		stateDir:        "raft-data",
 	}
 }
 
-// resetElectionTimerLocked signals that the election timer
-// should restart. The caller must hold r.mu.
+// The caller must hold r.mu.
 func (r *Raft) resetElectionTimerLocked() {
 	select {
 	case r.electionResetCh <- struct{}{}:
 	default:
-		// A reset signal is already pending.
 	}
 }
 
-// RunElectionTimer waits for a randomized timeout.
-// onTimeout is called when no reset signal arrives in time.
 func (r *Raft) RunElectionTimer(onTimeout func()) {
 	for {
 		timeout := time.Duration(150+rand.Intn(150)) * time.Millisecond
@@ -79,7 +80,6 @@ func (r *Raft) RunElectionTimer(onTimeout func()) {
 				default:
 				}
 			}
-
 		case <-timer.C:
 			onTimeout()
 		}
@@ -92,10 +92,8 @@ func (s State) String() string {
 		return "Follower"
 	case Candidate:
 		return "Candidate"
-
 	case Leader:
 		return "Leader"
-
 	default:
 		return "unknown"
 	}
@@ -105,10 +103,29 @@ func (r *Raft) StartElection() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	oldTerm := r.CurrentTerm
+	oldState := r.State
+	oldVote := r.VotedFor
+	oldLeader := r.LeaderID
+
 	r.CurrentTerm++
 	r.State = Candidate
 	r.VotedFor = r.ID
 	r.LeaderID = -1
+
+	if err := r.savePersistentStateLocked(); err != nil {
+		r.CurrentTerm = oldTerm
+		r.State = oldState
+		r.VotedFor = oldVote
+		r.LeaderID = oldLeader
+
+		fmt.Printf(
+			"Node %d: failed to persist election state: %v\n",
+			r.ID,
+			err,
+		)
+		return
+	}
 }
 
 func (r *Raft) stepDownIfHigherTerm(term int) bool {
@@ -169,11 +186,12 @@ func (r *Raft) LastLogTerm() int {
 	return r.lastLogTermLocked()
 }
 
-// Caller must already hold r.mu.
+// The caller must hold r.mu.
 func (r *Raft) lastLogTermLocked() int {
 	if len(r.log) == 0 {
 		return 0
 	}
+
 	return r.log[len(r.log)-1].Term
 }
 
@@ -190,11 +208,27 @@ func (r *Raft) RequestVote(args VoteRequest) VoteResponse {
 		return response
 	}
 
+	// Persist a higher term before processing the vote request.
 	if args.Term > r.CurrentTerm {
+		oldTerm := r.CurrentTerm
+		oldVote := r.VotedFor
+		oldState := r.State
+		oldLeader := r.LeaderID
+
 		r.CurrentTerm = args.Term
 		r.State = Follower
 		r.VotedFor = -1
 		r.LeaderID = -1
+
+		if err := r.savePersistentStateLocked(); err != nil {
+			r.CurrentTerm = oldTerm
+			r.VotedFor = oldVote
+			r.State = oldState
+			r.LeaderID = oldLeader
+
+			response.Term = r.CurrentTerm
+			return response
+		}
 	}
 
 	response.Term = r.CurrentTerm
@@ -209,10 +243,19 @@ func (r *Raft) RequestVote(args VoteRequest) VoteResponse {
 
 	if candidateLogIsUpToDate &&
 		(r.VotedFor == -1 || r.VotedFor == args.CandidateID) {
+
+		oldVote := r.VotedFor
 		r.VotedFor = args.CandidateID
+
+		// Save the vote before granting it.
+		if err := r.savePersistentStateLocked(); err != nil {
+			r.VotedFor = oldVote
+			response.Term = r.CurrentTerm
+			return response
+		}
+
 		response.VoteGranted = true
 		r.resetElectionTimerLocked()
-
 	}
 
 	return response
@@ -221,27 +264,31 @@ func (r *Raft) RequestVote(args VoteRequest) VoteResponse {
 func RunElection(nodes []*Raft, candidate *Raft) int {
 	candidate.StartElection()
 
-	votes := 1 // Candidate votes for itself.
+	candidate.mu.Lock()
+	term := candidate.CurrentTerm
+	candidateID := candidate.ID
+	lastLogIndex := len(candidate.log)
+	lastLogTerm := candidate.lastLogTermLocked()
+	candidate.mu.Unlock()
+
+	votes := 1
 
 	for _, peer := range nodes {
-		if peer == nil || peer.ID == candidate.ID {
+		if peer == nil || peer.ID == candidateID {
 			continue
 		}
 
 		request := VoteRequest{
-			Term:         candidate.CurrentTerm,
-			CandidateID:  candidate.ID,
-			LastLogIndex: candidate.LastLogIndex(),
-			LastLogTerm:  candidate.LastLogTerm(),
+			Term:         term,
+			CandidateID:  candidateID,
+			LastLogIndex: lastLogIndex,
+			LastLogTerm:  lastLogTerm,
 		}
 
 		response := peer.RequestVote(request)
 
-		// A newer term means this candidate must step down.
-		if response.Term > candidate.CurrentTerm {
-			candidate.CurrentTerm = response.Term
-			candidate.State = Follower
-			candidate.VotedFor = -1
+		if response.Term > term {
+			candidate.stepDownIfHigherTerm(response.Term)
 			return votes
 		}
 
@@ -252,8 +299,12 @@ func RunElection(nodes []*Raft, candidate *Raft) int {
 
 	majority := len(nodes)/2 + 1
 
-	// Check the result only after collecting the votes.
-	if candidate.State == Candidate && votes >= majority {
+	candidate.mu.Lock()
+	defer candidate.mu.Unlock()
+
+	if candidate.State == Candidate &&
+		candidate.CurrentTerm == term &&
+		votes >= majority {
 		candidate.State = Leader
 		candidate.LeaderID = candidate.ID
 	}
@@ -270,25 +321,37 @@ func (r *Raft) AppendEntries(args AppendEntriesRequest) AppendEntriesResponse {
 		Success: false,
 	}
 
-	// Reject requests from an outdated leader.
 	if args.Term < r.CurrentTerm {
 		return response
 	}
 
-	// A newer term means we must update our term and step down.
+	// Save the old persistent state so we can roll back if saving fails.
+	oldTerm := r.CurrentTerm
+	oldVote := r.VotedFor
+	oldLog := append([]LogEntry(nil), r.log...)
+
 	if args.Term > r.CurrentTerm {
 		r.CurrentTerm = args.Term
 		r.VotedFor = -1
 	}
 
-	// A valid leader's request makes us a follower.
 	r.State = Follower
 	r.LeaderID = args.LeaderID
 	r.resetElectionTimerLocked()
 
 	response.Term = r.CurrentTerm
 
-	// Check whether the previous log entry matches.
+	// Persist a newer term before processing the log.
+	if args.Term > oldTerm {
+		if err := r.savePersistentStateLocked(); err != nil {
+			r.CurrentTerm = oldTerm
+			r.VotedFor = oldVote
+			response.Term = r.CurrentTerm
+			return response
+		}
+	}
+
+	// Verify the previous log entry.
 	if args.PrevLogIndex > len(r.log) {
 		return response
 	}
@@ -301,7 +364,7 @@ func (r *Raft) AppendEntries(args AppendEntriesRequest) AppendEntriesResponse {
 		}
 	}
 
-	// Append incoming entries, removing conflicting entries if needed.
+	// Append new entries and remove conflicting suffixes.
 	for i, entry := range args.Entries {
 		index := args.PrevLogIndex + i
 
@@ -317,14 +380,28 @@ func (r *Raft) AppendEntries(args AppendEntriesRequest) AppendEntriesResponse {
 		}
 	}
 
-	// Advance the follower's commit index without exceeding its log.
+	// Persist the modified log before acknowledging replication.
+	if err := r.savePersistentStateLocked(); err != nil {
+		r.CurrentTerm = oldTerm
+		r.VotedFor = oldVote
+		r.log = oldLog
+		response.Term = r.CurrentTerm
+		return response
+	}
+
+	// Update the follower's commit index.
 	if args.LeaderCommit > r.CommitIndex {
 		r.CommitIndex = args.LeaderCommit
+
 		if r.CommitIndex > len(r.log) {
 			r.CommitIndex = len(r.log)
 		}
 	}
 
+	// Apply committed entries to the follower's state machine.
+	r.applyCommittedEntriesLocked()
+
+	response.Term = r.CurrentTerm
 	response.Success = true
 	return response
 }
@@ -342,7 +419,16 @@ func (r *Raft) ProposeCommand(command string) error {
 		Command: command,
 	}
 
+	// Remember the current log length so we can roll back on failure.
+	oldLogLength := len(r.log)
+
 	r.log = append(r.log, entry)
+
+	// Persist the new entry before accepting the proposal.
+	if err := r.savePersistentStateLocked(); err != nil {
+		r.log = r.log[:oldLogLength]
+		return fmt.Errorf("persist command on node %d: %w", r.ID, err)
+	}
 
 	fmt.Printf(
 		"Leader %d appended command %q at log index %d\n",
@@ -352,4 +438,37 @@ func (r *Raft) ProposeCommand(command string) error {
 	)
 
 	return nil
+}
+
+// The caller must hold r.mu.
+// Apply committed commands in log order.
+func (r *Raft) applyCommittedEntriesLocked() {
+	if r.kvStore == nil {
+		r.kvStore = make(map[string]string)
+	}
+
+	for r.LastApplied < r.CommitIndex {
+		// Log indexes start at 1; slice indexes start at 0.
+		entry := r.log[r.LastApplied]
+
+		command := strings.TrimSpace(entry.Command)
+		operation, argument, found := strings.Cut(command, " ")
+
+		if found && operation == "SET" {
+			key, value, valid := strings.Cut(
+				strings.TrimSpace(argument),
+				"=",
+			)
+
+			key = strings.TrimSpace(key)
+			value = strings.TrimSpace(value)
+
+			if valid && key != "" {
+				r.kvStore[key] = value
+			}
+		}
+
+		// Advance after processing this entry.
+		r.LastApplied++
+	}
 }

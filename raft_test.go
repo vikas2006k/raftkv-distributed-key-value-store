@@ -340,3 +340,113 @@ func TestAdvanceCommitIndexWithoutMajority(t *testing.T) {
 		)
 	}
 }
+
+func TestAdvanceCommitIndexWithMajorityFiveNodes(t *testing.T) {
+	leader := newRaft(1)
+	leader.State = Leader
+	leader.CurrentTerm = 2
+	leader.log = []LogEntry{
+		{Term: 2, Command: "SET x=10"},
+	}
+
+	leader.nextIndex = map[int]int{
+		2: 2,
+		3: 2,
+		4: 1,
+		5: 1,
+	}
+
+	// Nodes 1, 2, and 3 have replicated index 1.
+	// That is a majority of a five-node cluster.
+	leader.matchIndex = map[int]int{
+		2: 1,
+		3: 1,
+		4: 0,
+		5: 0,
+	}
+
+	peers := []Peer{
+		{ID: 2, Address: "unused"},
+		{ID: 3, Address: "unused"},
+		{ID: 4, Address: "unused"},
+		{ID: 5, Address: "unused"},
+	}
+
+	advanceCommitIndex(leader, peers)
+
+	leader.mu.Lock()
+	defer leader.mu.Unlock()
+
+	if leader.CommitIndex != 1 {
+		t.Fatalf(
+			"expected CommitIndex to be 1 with a majority, got %d",
+			leader.CommitIndex,
+		)
+	}
+
+	if leader.LastApplied != 1 {
+		t.Fatalf(
+			"expected LastApplied to be 1 after commitment, got %d",
+			leader.LastApplied,
+		)
+	}
+
+	if got := leader.kvStore["x"]; got != "10" {
+		t.Fatalf("expected kvStore[x] to be 10, got %q", got)
+	}
+}
+
+func TestPersistentStateSaveAndLoad(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create the original node and assign a temporary storage directory.
+	original := newRaft(1)
+	original.stateDir = dir
+
+	original.mu.Lock()
+	original.CurrentTerm = 5
+	original.VotedFor = 2
+	original.log = []LogEntry{
+		{Term: 3, Command: "SET x=10"},
+		{Term: 5, Command: "SET y=20"},
+	}
+	original.mu.Unlock()
+
+	// Save the node's persistent state.
+	if err := original.savePersistentState(); err != nil {
+		t.Fatalf("failed to save persistent state: %v", err)
+	}
+
+	// Simulate a restart by creating a fresh node with the same ID.
+	restarted := newRaft(1)
+	restarted.stateDir = dir
+
+	if err := restarted.loadPersistentState(); err != nil {
+		t.Fatalf("failed to load persistent state: %v", err)
+	}
+
+	// Verify the term was recovered.
+	if restarted.CurrentTerm != 5 {
+		t.Errorf("CurrentTerm = %d, want 5", restarted.CurrentTerm)
+	}
+
+	// Verify the vote was recovered.
+	if restarted.VotedFor != 2 {
+		t.Errorf("VotedFor = %d, want 2", restarted.VotedFor)
+	}
+
+	// Verify the log was recovered.
+	if len(restarted.log) != 2 {
+		t.Fatalf("log length = %d, want 2", len(restarted.log))
+	}
+
+	if restarted.log[0].Command != "SET x=10" {
+		t.Errorf("first command = %q, want %q",
+			restarted.log[0].Command, "SET x=10")
+	}
+
+	if restarted.log[1].Command != "SET y=20" {
+		t.Errorf("second command = %q, want %q",
+			restarted.log[1].Command, "SET y=20")
+	}
+}
